@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Run a Hugging Face GGUF model with llama.cpp. Bash port of llama-hf.ps1.
+#
+# llama's built-in -hf downloader cannot complete the TLS handshake with
+# us.aws.cdn.hf.co, where Hugging Face redirects model weights. The corporate
+# Zscaler proxy intercepts that host and presents a chain rooted at
+# "Amdocs RSA Root CA", and llama.cpp <= b10121 verifies with OpenSSL against an
+# empty default trust store, so every download dies with "status code: -1".
+# curl verifies with Schannel and trusts that root from the Windows store, so we
+# fetch with curl and hand the local file to llama.
+#
+# Drop this script once llama.cpp b10122 or later is installed: cpp-httplib
+# 0.51.0 turns on Schannel verification by default and plain -hf will work.
+#
+#   ./llama-hf ggml-org/gemma-3-270m-it-qat-GGUF:Q4_0
+#   ./llama-hf ggml-org/gemma-3-270m-it-qat-GGUF:Q4_0 --port 9090 -c 8192
+#   LLAMA_CMD=cli ./llama-hf ggml-org/gemma-3-270m-it-qat-GGUF:Q4_0
+
+set -euo pipefail
+
+if [ $# -lt 1 ]; then
+    echo "usage: llama-hf <user/repo>[:QUANT] [extra llama args...]" >&2
+    exit 1
+fi
+
+spec="$1"
+shift
+
+repo="${spec%%:*}"
+if [ "$spec" = "$repo" ]; then
+    quant="Q4_K_M"
+else
+    quant="${spec#*:}"
+fi
+
+cache="${LLAMA_CACHE:-${LOCALAPPDATA}/llama.cpp}"
+mkdir -p "$cache"
+
+file=$(curl -sSfL "https://huggingface.co/api/models/${repo}" | python -c '
+import json, sys
+quant = sys.argv[1].lower()
+siblings = json.load(sys.stdin).get("siblings", [])
+ggufs = [s["rfilename"] for s in siblings if s["rfilename"].lower().endswith(".gguf")]
+if not ggufs:
+    sys.exit("no .gguf files in repo")
+matches = [f for f in ggufs if quant in f.lower()]
+if not matches:
+    sys.exit("no .gguf matching quant %r; available: %s" % (quant, ", ".join(ggufs)))
+print(matches[0])
+' "$quant")
+
+# llama's own cache naming, so a later native -hf run reuses the same file
+target="${cache}/$(printf '%s_%s' "$repo" "$file" | tr '/' '_')"
+
+if [ ! -s "$target" ]; then
+    echo "llama-hf: downloading ${repo}/${file}" >&2
+    curl -L --fail --retry 3 -C - -o "${target}.part" \
+        "https://huggingface.co/${repo}/resolve/main/${file}"
+    mv "${target}.part" "$target"
+fi
+
+exec llama "${LLAMA_CMD:-serve}" -m "$target" "$@"
